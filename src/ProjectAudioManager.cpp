@@ -101,11 +101,89 @@ auto ProjectAudioManager::StatusWidthFunction(
 
 extern "C" void RegisterFunctions();
 
-TransportTracks FilterFrequencies(TransportTracks tracks, double f0, double f1) {
-    std::cerr << "FilterFrequencies, " << tracks.playbackTracks.size() << " tracks, f0 " << f0 << ", f1 " << f1 << "\n";
+std::vector<std::shared_ptr<WaveTrack>> FilterFrequencies(
+    std::vector<std::shared_ptr<WaveTrack>> tracks,
+    double f0,
+    double f1
+) {
+    RegisterFunctions();
+
+    nyx_init();
+    // TODO: os callback
+    // TODO: capture output
+    nyx_set_audio_name("*TRACK*");
+    std::cerr << "nyx_set_audio_params\n";
+    nyx_set_audio_params(
+        tracks[0]->GetRate(),
+        tracks[0]->GetNumSamples().as_long_long());
+
+    std::cerr << "nyx_set_input_audio\n";
+    nyx_set_input_audio(
+        +[](float* buffer,
+            int ch,
+            int64_t start,
+            int64_t len,
+            int64_t WXUNUSED(totlen),
+            void* _tracks) noexcept {
+            auto* tracks = (std::vector<std::shared_ptr<WaveTrack>>*)_tracks;
+            tracks->at(ch)->Get((samplePtr)buffer, floatSample, start, len);
+            return 0;
+        },
+        &tracks,
+        (int)tracks.size(),
+        tracks[0]->GetNumSamples().as_long_long(),
+        tracks[0]->GetRate());
+
+    nyx_rval rval = nyx_eval_expression(
+            wxString::Format(wxT("(lowpass8 (highpass8 *track* %f) %f)"), f0, f1).c_str());
+    std::cerr << "rval == " << rval << "\n";
+    wxASSERT(rval == nyx_audio);
+
+    std::vector<std::shared_ptr<WaveTrack>> filteredTracks;
+    for (int i = 0; i < nyx_get_audio_num_channels(); ++i) {
+        auto track = tracks[i]->EmptyCopy();
+        track->SetRate(tracks[i]->GetRate());
+        filteredTracks.push_back(track);
+    }
+
+    int success = nyx_get_audio(
+            +[](float* buffer,
+                int channel,
+                int64_t start,
+                int64_t len,
+                int64_t totlen,
+                void* _tracks) noexcept {
+                auto* tracks = (std::vector<std::shared_ptr<WaveTrack>>*)_tracks;
+                tracks->at(channel)->Append((samplePtr)buffer, floatSample, len);
+                return 0;
+            },
+            &filteredTracks);
+    // TODO: error handling, yolo
+    std::cerr << "nyx_get_audio success = " << success << "\n";
+
+    std::cerr << "cleanup\n";
+    nyx_capture_output(NULL, NULL);
+    nyx_cleanup();
+
+    return filteredTracks;
+}
+
+// filters only playbackTracks
+TransportTracks FilterPlaybackTracksFrequencies(
+    TransportTracks tracks,
+    double t0,
+    double t1,
+    double f0,
+    double f1
+) {
+    std::cerr
+        << "FilterPlaybackTrackFrequencies, " << tracks.playbackTracks.size() << " tracks, "
+        << "t0 " << t0 << ", t1 " << t1 << ", "
+        << "f0 " << f0 << ", f1 " << f1 << "\n";
     if (f0 == SelectedRegion::UndefinedFrequency && f1 == SelectedRegion::UndefinedFrequency) {
         return tracks;
     }
+
     if (f1 < f0) {
         std::swap(f0, f1);
     }
@@ -116,67 +194,29 @@ TransportTracks FilterFrequencies(TransportTracks tracks, double f0, double f1) 
         f1 = tracks.playbackTracks[0]->GetRate() / 2.0;
     }
 
-    TransportTracks filteredTracks;
-
-    RegisterFunctions();
-
-    nyx_init();
-    // TODO: os callback
-    // TODO: capture output
-    nyx_set_audio_name("*TRACK*");
-    std::cerr << "nyx_set_audio_params\n";
-    nyx_set_audio_params(
-        tracks.playbackTracks[0]->GetRate(),
-        tracks.playbackTracks[0]->GetNumSamples().as_long_long());
-    std::cerr << "nyx_set_input_audio\n";
-    nyx_set_input_audio(
-        +[](float* buffer,
-            int ch,
-            int64_t start,
-            int64_t len,
-            int64_t WXUNUSED(totlen),
-            void* _tracks) noexcept {
-            TransportTracks* tracks = (TransportTracks*)_tracks;
-            tracks->playbackTracks[ch]->Get((samplePtr)buffer, floatSample, start, len);
-            return 0;
-        },
-        &tracks,
-        (int)tracks.playbackTracks.size(),
-        tracks.playbackTracks[0]->GetNumSamples().as_long_long(),
-        tracks.playbackTracks[0]->GetRate());
-
-    nyx_rval rval = nyx_eval_expression(
-            wxString::Format(wxT("(lowpass8 (highpass8 *track* %f) %f)"), f0, f1).c_str());
-    std::cerr << "rval == " << rval << "\n";
-    wxASSERT(rval == nyx_audio);
-
-    static std::shared_ptr<TrackList> bullshitTracksOwner = TrackList::Create(nullptr);
-    bullshitTracksOwner->Clear();
-
-    for (int i = 0; i < nyx_get_audio_num_channels(); ++i) {
-        auto track = tracks.playbackTracks[i]->EmptyCopy();
-        track->SetRate(tracks.playbackTracks[0]->GetRate());
-        bullshitTracksOwner->Add(track);
-        filteredTracks.playbackTracks.push_back(track);
+    // slice the input to only filter the selected part, filtering is *slow*
+    // keep the initial part of audio so that t0/t1 used later for playback still work
+    // discard anything after t1, we don't need that
+    std::vector<std::shared_ptr<WaveTrack>> initialPart;
+    std::vector<std::shared_ptr<WaveTrack>> selectedPart;
+    for (const auto& track : tracks.playbackTracks) {
+        // why does WaveTrack::Copy return shared_ptr<WaveTrack> as shared_ptr<Track>?!
+        initialPart.push_back(std::dynamic_pointer_cast<WaveTrack>(track->Copy(0.0, t0)));
+        selectedPart.push_back(std::dynamic_pointer_cast<WaveTrack>(track->Copy(t0, t1)));
     }
-    int success = nyx_get_audio(
-            +[](float* buffer,
-                int channel,
-                int64_t start,
-                int64_t len,
-                int64_t totlen,
-                void* _tracks) noexcept {
-                TransportTracks* tracks = (TransportTracks*)_tracks;
-                tracks->playbackTracks[channel]->Append((samplePtr)buffer, floatSample, len);
-                return 0;
-            },
-            &filteredTracks);
-    // TODO: error handling, yolo
-    std::cerr << "nyx_get_audio success = " << success << "\n";
+    auto filteredSelectedPart = FilterFrequencies(std::move(selectedPart), f0, f1);
 
-    std::cerr << "cleanup\n";
-    nyx_capture_output(NULL, NULL);
-    nyx_cleanup();
+    static std::shared_ptr<TrackList> bullshitTracksOwner;
+    bullshitTracksOwner = TrackList::Create(nullptr);
+
+    TransportTracks filteredTracks;
+    for (int i = 0; i < initialPart.size(); ++i) {
+        auto filteredTrack = std::move(initialPart[i]);
+        filteredTrack->Paste(filteredTrack->GetEndTime(), filteredSelectedPart[i].get());
+        // something crashes later when a track has no owner
+        bullshitTracksOwner->Add(filteredTrack);
+        filteredTracks.playbackTracks.push_back(filteredTrack);
+    }
 
     return filteredTracks;
 }
@@ -318,7 +358,9 @@ int ProjectAudioManager::PlayPlayRegion(const SelectedRegion &selectedRegion,
             myOptions.cutPreviewGapStart = t0;
             myOptions.cutPreviewGapLen = t1 - t0;
             token = gAudioIO->StartStream(
-               FilterFrequencies(GetAllPlaybackTracks(*mCutPreviewTracks, false, useMidi), f0, f1),
+               FilterPlaybackTracksFrequencies(
+                   GetAllPlaybackTracks(*mCutPreviewTracks, false, useMidi),
+                   t0, t1, f0, f1),
                tcp0, tcp1, myOptions);
          }
          else
@@ -327,7 +369,9 @@ int ProjectAudioManager::PlayPlayRegion(const SelectedRegion &selectedRegion,
       }
       else {
          token = gAudioIO->StartStream(
-            FilterFrequencies(GetAllPlaybackTracks( tracks, false, useMidi ), f0, f1),
+            FilterPlaybackTracksFrequencies(
+                GetAllPlaybackTracks( tracks, false, useMidi ),
+                t0, t1, f0, f1),
             t0, t1, options);
       }
       if (token != 0) {
