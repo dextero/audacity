@@ -632,7 +632,7 @@ bool NyquistEffect::CheckWhetherSkipEffect()
    return (mIsPrompt && mControls.size() > 0 && !IsBatchProcessing());
 }
 
-static void RegisterFunctions();
+extern "C" void RegisterFunctions();
 
 bool NyquistEffect::Process()
 {
@@ -3475,7 +3475,7 @@ LVAL xlc_aud_do(void)
     return (dst);
 }
 
-static void RegisterFunctions()
+extern "C" void RegisterFunctions()
 {
    // Add functions to XLisp.  Do this only once,
    // before the first call to nyx_init.

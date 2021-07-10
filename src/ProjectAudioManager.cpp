@@ -11,7 +11,9 @@ Paul Licameli split from ProjectManager.cpp
 
 #include "ProjectAudioManager.h"
 
+#include <sstream>
 
+#include "nyx.h"
 
 #include <wx/frame.h>
 #include <wx/statusbr.h>
@@ -29,6 +31,7 @@ Paul Licameli split from ProjectManager.cpp
 #include "TimeTrack.h"
 #include "TrackPanelAx.h"
 #include "UndoManager.h"
+#include "SelectedRegion.h"
 #include "ViewInfo.h"
 #include "WaveTrack.h"
 #include "toolbars/ToolManager.h"
@@ -96,6 +99,88 @@ auto ProjectAudioManager::StatusWidthFunction(
    return {};
 }
 
+extern "C" void RegisterFunctions();
+
+TransportTracks FilterFrequencies(TransportTracks tracks, double f0, double f1) {
+    std::cerr << "FilterFrequencies, " << tracks.playbackTracks.size() << " tracks, f0 " << f0 << ", f1 " << f1 << "\n";
+    if (f0 == SelectedRegion::UndefinedFrequency && f1 == SelectedRegion::UndefinedFrequency) {
+        return tracks;
+    }
+    if (f1 < f0) {
+        std::swap(f0, f1);
+    }
+    if (f0 == SelectedRegion::UndefinedFrequency) {
+        f0 = 0.1;
+    }
+    if (f1 == SelectedRegion::UndefinedFrequency) {
+        f1 = tracks.playbackTracks[0]->GetRate() / 2.0;
+    }
+
+    TransportTracks filteredTracks;
+
+    RegisterFunctions();
+
+    nyx_init();
+    // TODO: os callback
+    // TODO: capture output
+    nyx_set_audio_name("*TRACK*");
+    std::cerr << "nyx_set_audio_params\n";
+    nyx_set_audio_params(
+        tracks.playbackTracks[0]->GetRate(),
+        tracks.playbackTracks[0]->GetNumSamples().as_long_long());
+    std::cerr << "nyx_set_input_audio\n";
+    nyx_set_input_audio(
+        +[](float* buffer,
+            int ch,
+            int64_t start,
+            int64_t len,
+            int64_t WXUNUSED(totlen),
+            void* _tracks) noexcept {
+            TransportTracks* tracks = (TransportTracks*)_tracks;
+            tracks->playbackTracks[ch]->Get((samplePtr)buffer, floatSample, start, len);
+            return 0;
+        },
+        &tracks,
+        (int)tracks.playbackTracks.size(),
+        tracks.playbackTracks[0]->GetNumSamples().as_long_long(),
+        tracks.playbackTracks[0]->GetRate());
+
+    nyx_rval rval = nyx_eval_expression(
+            wxString::Format(wxT("(lowpass8 (highpass8 *track* %f) %f)"), f0, f1).c_str());
+    std::cerr << "rval == " << rval << "\n";
+    wxASSERT(rval == nyx_audio);
+
+    static std::shared_ptr<TrackList> bullshitTracksOwner = TrackList::Create(nullptr);
+    bullshitTracksOwner->Clear();
+
+    for (int i = 0; i < nyx_get_audio_num_channels(); ++i) {
+        auto track = tracks.playbackTracks[i]->EmptyCopy();
+        track->SetRate(tracks.playbackTracks[0]->GetRate());
+        bullshitTracksOwner->Add(track);
+        filteredTracks.playbackTracks.push_back(track);
+    }
+    int success = nyx_get_audio(
+            +[](float* buffer,
+                int channel,
+                int64_t start,
+                int64_t len,
+                int64_t totlen,
+                void* _tracks) noexcept {
+                TransportTracks* tracks = (TransportTracks*)_tracks;
+                tracks->playbackTracks[channel]->Append((samplePtr)buffer, floatSample, len);
+                return 0;
+            },
+            &filteredTracks);
+    // TODO: error handling, yolo
+    std::cerr << "nyx_get_audio success = " << success << "\n";
+
+    std::cerr << "cleanup\n";
+    nyx_capture_output(NULL, NULL);
+    nyx_cleanup();
+
+    return filteredTracks;
+}
+
 /*! @excsafety{Strong} -- For state of mCutPreviewTracks */
 int ProjectAudioManager::PlayPlayRegion(const SelectedRegion &selectedRegion,
                                    const AudioIOStartStreamOptions &options,
@@ -120,6 +205,8 @@ int ProjectAudioManager::PlayPlayRegion(const SelectedRegion &selectedRegion,
 
    double t0 = selectedRegion.t0();
    double t1 = selectedRegion.t1();
+   const double f0 = selectedRegion.f0();
+   const double f1 = selectedRegion.f1();
    // SelectedRegion guarantees t0 <= t1, so we need another boolean argument
    // to indicate backwards play.
    const bool looped = options.playLooped;
@@ -231,7 +318,7 @@ int ProjectAudioManager::PlayPlayRegion(const SelectedRegion &selectedRegion,
             myOptions.cutPreviewGapStart = t0;
             myOptions.cutPreviewGapLen = t1 - t0;
             token = gAudioIO->StartStream(
-               GetAllPlaybackTracks(*mCutPreviewTracks, false, useMidi),
+               FilterFrequencies(GetAllPlaybackTracks(*mCutPreviewTracks, false, useMidi), f0, f1),
                tcp0, tcp1, myOptions);
          }
          else
@@ -240,7 +327,7 @@ int ProjectAudioManager::PlayPlayRegion(const SelectedRegion &selectedRegion,
       }
       else {
          token = gAudioIO->StartStream(
-            GetAllPlaybackTracks( tracks, false, useMidi ),
+            FilterFrequencies(GetAllPlaybackTracks( tracks, false, useMidi ), f0, f1),
             t0, t1, options);
       }
       if (token != 0) {
@@ -290,7 +377,7 @@ void ProjectAudioManager::PlayCurrentRegion(bool looped /* = false */,
 
    {
 
-      const auto &playRegion = ViewInfo::Get( *p ).playRegion;
+      const auto &selectedRegion = ViewInfo::Get( *p ).selectedRegion;
 
       auto options = DefaultPlayOptions( *p );
       options.playLooped = looped;
@@ -300,7 +387,7 @@ void ProjectAudioManager::PlayCurrentRegion(bool looped /* = false */,
          cutpreview ? PlayMode::cutPreviewPlay
          : options.playLooped ? PlayMode::loopedPlay
          : PlayMode::normalPlay;
-      PlayPlayRegion(SelectedRegion(playRegion.GetStart(), playRegion.GetEnd()),
+      PlayPlayRegion(selectedRegion,
                      options,
                      mode);
    }
